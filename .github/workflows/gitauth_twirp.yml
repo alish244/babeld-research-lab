@@ -1,0 +1,66 @@
+name: gitauth-twirp-probe-4f05fefe
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe_gitauth:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Twirp endpoint discovery
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== Twirp/Protobuf gitauth endpoint probing ==="
+          TOKEN="${{ secrets.GITHUB_TOKEN }}"
+
+          for ENDPOINT in /twirp/gitauth.AuthService/CommitRefs /twirp/gitauth.AuthService/CheckCommitRefs /twirp/github.gitauth.v1.GitauthService/CommitRefs /twirp/github.internal.gitauth.v1.GitauthService/CommitRefs /twirp/github.gitauth.GitauthService/CommitRefs /gitauth/commit_refs /api/gitauth/commit_refs /_gitauth/commit_refs; do
+            echo "--- $ENDPOINT ---"
+            # POST with empty Protobuf body (valid Twirp request)
+            code=$(curl -sf --connect-timeout 2 \
+                   -o /tmp/twirp_resp.txt -w "%{http_code}" \
+                   -X POST \
+                   -H "Content-Type: application/protobuf" \
+                   -H "Authorization: Bearer $TOKEN" \
+                   -d "" \
+                   "https://api.github.com$ENDPOINT" 2>/dev/null || echo "000")
+            echo "  POST api.github.com$ENDPOINT → HTTP $code"
+            if [ "$code" != "000" ] && [ "$code" != "404" ]; then
+              echo "  RESPONSE (first 200b):"
+              head -c 200 /tmp/twirp_resp.txt && echo
+            fi
+            # Also try JSON Twirp variant
+            code2=$(curl -sf --connect-timeout 2 \
+                   -o /tmp/twirp_json.txt -w "%{http_code}" \
+                   -X POST \
+                   -H "Content-Type: application/json" \
+                   -H "Authorization: Bearer $TOKEN" \
+                   -d '{"repository_id": 1, "commit_id": "abc123"}' \
+                   "https://api.github.com$ENDPOINT" 2>/dev/null || echo "000")
+            echo "  POST (JSON) api.github.com$ENDPOINT → HTTP $code2"
+            if [ "$code2" != "000" ] && [ "$code2" != "404" ]; then
+              head -c 200 /tmp/twirp_json.txt && echo
+            fi
+          done
+
+          echo "=== Try internal git host ==="
+          for host in git.github.internal github.internal upload.github.com; do
+            code=$(curl -sf --connect-timeout 1 -o /dev/null -w "%{http_code}" \
+                   "https://$host/" 2>/dev/null || echo "000")
+            echo "  $host → $code"
+          done
+
+          echo "=== X-Stat header format from git SSH probe ==="
+          # SSH git operations go through a different path — check SSH env
+          SSH_GIT_OUTPUT=$(GIT_SSH_COMMAND='ssh -v -o StrictHostKeyChecking=no' \
+            git ls-remote "git@github.com:alish244/rce-injection-lab.git" 2>&1 | head -30 || true)
+          echo "$SSH_GIT_OUTPUT"
+
+          echo "=== babeld Rust source hints (if build dir present) ==="
+          find /babeld-build /babeld /app -name "*.rs" 2>/dev/null | \
+            xargs grep -l 'x.?stat\|gitauth\|commit_refs' 2>/dev/null | head -10 | \
+            xargs -I{} grep -n 'x.?stat\|gitauth\|commit_refs\|X-Stat' {} 2>/dev/null | head -60 || true
